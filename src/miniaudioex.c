@@ -524,6 +524,21 @@ MA_API ma_bool8 ma_ex_audio_clip_is_initialized(ma_ex_audio_clip *clip) {
     return ma_sound_get_data_source(&clip->sound) != NULL;
 }
 
+static ma_bool8 ma_ex_audio_source_has_sound(ma_ex_audio_source *source) {
+    if(source == NULL)
+        return MA_FALSE;
+    return ma_ex_audio_clip_is_initialized(&source->clip);
+}
+
+static ma_result ma_ex_audio_source_finish_prepare(ma_ex_audio_source *source, ma_uint64 soundHash) {
+    if(source == NULL || ma_ex_audio_source_has_sound(source) == MA_FALSE)
+        return MA_ERROR;
+
+    source->clip.soundHash = soundHash;
+    ma_ex_audio_source_apply_settings(source);
+    return MA_SUCCESS;
+}
+
 MA_API ma_ex_audio_source *ma_ex_audio_source_init(ma_ex_context *context) {
     MA_ASSERT(context != NULL);
     
@@ -552,12 +567,13 @@ MA_API ma_ex_audio_source *ma_ex_audio_source_init(ma_ex_context *context) {
 
 MA_API void ma_ex_audio_source_uninit(ma_ex_audio_source *source) {
     if(source != NULL) {
-        ma_sound_uninit(&source->clip.sound);
+        if(ma_ex_audio_source_has_sound(source))
+            ma_sound_uninit(&source->clip.sound);
         MA_FREE(source);
     }
 }
 
-MA_API ma_result ma_ex_audio_source_play_from_file(ma_ex_audio_source *source, const char *filePath, ma_bool8 streamFromDisk) {
+MA_API ma_result ma_ex_audio_source_prepare_from_file(ma_ex_audio_source *source, const char *filePath, ma_bool8 streamFromDisk) {
     if(source == NULL)
         return MA_ERROR;
 
@@ -566,7 +582,8 @@ MA_API ma_result ma_ex_audio_source_play_from_file(ma_ex_audio_source *source, c
     
     ma_uint64 soundHash = ma_ex_create_hashcode(filePath, strlen(filePath));
 
-    ma_sound_uninit(&source->clip.sound);
+    if(ma_ex_audio_source_has_sound(source))
+        ma_sound_uninit(&source->clip.sound);
 
     source->clip.flags = MA_SOUND_FLAG_DECODE;
     
@@ -580,12 +597,17 @@ MA_API ma_result ma_ex_audio_source_play_from_file(ma_ex_audio_source *source, c
         return MA_ERROR;
     }
 
-    source->clip.soundHash = soundHash;
-    ma_ex_audio_source_apply_settings(source);
-    return ma_sound_start(&source->clip.sound);
+    return ma_ex_audio_source_finish_prepare(source, soundHash);
 }
 
-MA_API ma_result ma_ex_audio_source_play_from_file_w(ma_ex_audio_source *source, const wchar_t *filePath, ma_bool8 streamFromDisk) {
+MA_API ma_result ma_ex_audio_source_play_from_file(ma_ex_audio_source *source, const char *filePath, ma_bool8 streamFromDisk) {
+    ma_result result = ma_ex_audio_source_prepare_from_file(source, filePath, streamFromDisk);
+    if(result != MA_SUCCESS)
+        return result;
+    return ma_ex_audio_source_start(source);
+}
+
+MA_API ma_result ma_ex_audio_source_prepare_from_file_w(ma_ex_audio_source *source, const wchar_t *filePath, ma_bool8 streamFromDisk) {
     if(source == NULL)
         return MA_ERROR;
 
@@ -594,7 +616,8 @@ MA_API ma_result ma_ex_audio_source_play_from_file_w(ma_ex_audio_source *source,
     
     ma_uint64 soundHash = ma_ex_create_hashcode(filePath, wcslen(filePath));
 
-    ma_sound_uninit(&source->clip.sound);
+    if(ma_ex_audio_source_has_sound(source))
+        ma_sound_uninit(&source->clip.sound);
 
     source->clip.flags = MA_SOUND_FLAG_DECODE;
     
@@ -608,12 +631,17 @@ MA_API ma_result ma_ex_audio_source_play_from_file_w(ma_ex_audio_source *source,
         return MA_ERROR;
     }
 
-    source->clip.soundHash = soundHash;
-    ma_ex_audio_source_apply_settings(source);
-    return ma_sound_start(&source->clip.sound);
+    return ma_ex_audio_source_finish_prepare(source, soundHash);
 }
 
-MA_API ma_result ma_ex_audio_source_play_from_memory(ma_ex_audio_source *source, const void *pData, ma_uint64 dataSize) {
+MA_API ma_result ma_ex_audio_source_play_from_file_w(ma_ex_audio_source *source, const wchar_t *filePath, ma_bool8 streamFromDisk) {
+    ma_result result = ma_ex_audio_source_prepare_from_file_w(source, filePath, streamFromDisk);
+    if(result != MA_SUCCESS)
+        return result;
+    return ma_ex_audio_source_start(source);
+}
+
+MA_API ma_result ma_ex_audio_source_prepare_from_memory(ma_ex_audio_source *source, const void *pData, ma_uint64 dataSize) {
     if(source == NULL)
         return MA_ERROR;
 
@@ -625,7 +653,8 @@ MA_API ma_result ma_ex_audio_source_play_from_memory(ma_ex_audio_source *source,
     
     ma_uint64 soundHash = ma_ex_pointer_to_hashcode(pData);
 
-    ma_sound_uninit(&source->clip.sound);
+    if(ma_ex_audio_source_has_sound(source))
+        ma_sound_uninit(&source->clip.sound);
 
     source->clip.flags = MA_SOUND_FLAG_DECODE;
 
@@ -636,25 +665,37 @@ MA_API ma_result ma_ex_audio_source_play_from_memory(ma_ex_audio_source *source,
         return MA_ERROR;
     }
 
-    source->clip.soundHash = soundHash;
-    ma_ex_audio_source_apply_settings(source);
-    return ma_sound_start(&source->clip.sound);
+    return ma_ex_audio_source_finish_prepare(source, soundHash);
 }
 
-MA_API ma_result ma_ex_audio_source_play_from_callback(ma_ex_audio_source *source, ma_procedural_data_source_proc callback, void *pUserData) {
+MA_API ma_result ma_ex_audio_source_play_from_memory(ma_ex_audio_source *source, const void *pData, ma_uint64 dataSize) {
+    ma_result result = ma_ex_audio_source_prepare_from_memory(source, pData, dataSize);
+    if(result != MA_SUCCESS)
+        return result;
+    return ma_ex_audio_source_start(source);
+}
+
+MA_API ma_result ma_ex_audio_source_prepare_from_callback(ma_ex_audio_source *source, ma_procedural_data_source_proc callback, void *pUserData, ma_uint32 channels, ma_uint32 sampleRate) {
     if(source == NULL)
         return MA_ERROR;
 
     if(callback == NULL)
         return MA_INVALID_ARGS;
+
+    if(channels == 0)
+        channels = source->context->channels;
+
+    if(sampleRate == 0)
+        sampleRate = source->context->sampleRate;
     
     ma_uint64 soundHash = ma_ex_pointer_to_hashcode(callback);
 
-    ma_sound_uninit(&source->clip.sound);
+    if(ma_ex_audio_source_has_sound(source))
+        ma_sound_uninit(&source->clip.sound);
 
     source->clip.flags = 0;
 
-    ma_procedural_data_source_config config = ma_procedural_data_source_config_init(ma_format_f32, source->context->channels, source->context->sampleRate, callback, pUserData != NULL ? pUserData : source);
+    ma_procedural_data_source_config config = ma_procedural_data_source_config_init(ma_format_f32, channels, sampleRate, callback, pUserData != NULL ? pUserData : source);
 
     ma_result result = ma_sound_init_from_callback(&source->context->engine, &config, source->clip.flags, source->group, NULL, &source->clip.sound);
 
@@ -663,19 +704,30 @@ MA_API ma_result ma_ex_audio_source_play_from_callback(ma_ex_audio_source *sourc
         return MA_ERROR;
     }
 
-    source->clip.soundHash = soundHash;
-    ma_ex_audio_source_apply_settings(source);
+    return ma_ex_audio_source_finish_prepare(source, soundHash);
+}
+
+MA_API ma_result ma_ex_audio_source_play_from_callback(ma_ex_audio_source *source, ma_procedural_data_source_proc callback, void *pUserData, ma_uint32 channels, ma_uint32 sampleRate) {
+    ma_result result = ma_ex_audio_source_prepare_from_callback(source, callback, pUserData, channels, sampleRate);
+    if(result != MA_SUCCESS)
+        return result;
+    return ma_ex_audio_source_start(source);
+}
+
+MA_API ma_result ma_ex_audio_source_start(ma_ex_audio_source *source) {
+    if(source == NULL || ma_ex_audio_source_has_sound(source) == MA_FALSE)
+        return MA_ERROR;
     return ma_sound_start(&source->clip.sound);
 }
 
 MA_API void ma_ex_audio_source_stop(ma_ex_audio_source *source) {
-    if(source != NULL) {
+    if(source != NULL && ma_ex_audio_source_has_sound(source)) {
         ma_sound_stop(&source->clip.sound);
     }
 }
 
 MA_API void ma_ex_audio_source_apply_settings(ma_ex_audio_source *source) {
-    if(source != NULL) {
+    if(source != NULL && ma_ex_audio_source_has_sound(source)) {
         ma_sound_set_attenuation_model(&source->clip.sound, source->settings.attenuationModel);
         ma_sound_set_direction(&source->clip.sound, source->settings.direction.x, source->settings.direction.y, source->settings.direction.z);
         ma_sound_set_doppler_factor(&source->clip.sound, source->settings.dopplerFactor);
@@ -695,7 +747,8 @@ MA_API void ma_ex_audio_source_apply_settings(ma_ex_audio_source *source) {
 MA_API void ma_ex_audio_source_set_volume(ma_ex_audio_source *source, float value) {
     if(source != NULL) {
         source->settings.volume = value;
-        ma_sound_set_volume(&source->clip.sound, value);
+        if(ma_ex_audio_source_has_sound(source))
+            ma_sound_set_volume(&source->clip.sound, value);
     }
 }
 
@@ -708,7 +761,8 @@ MA_API float ma_ex_audio_source_get_volume(ma_ex_audio_source *source) {
 MA_API void ma_ex_audio_source_set_pitch(ma_ex_audio_source *source, float value) {
     if(source != NULL) {
         source->settings.pitch = value;
-        ma_sound_set_pitch(&source->clip.sound, value);
+        if(ma_ex_audio_source_has_sound(source))
+            ma_sound_set_pitch(&source->clip.sound, value);
     }
 }
 
@@ -721,7 +775,8 @@ MA_API float ma_ex_audio_source_get_pitch(ma_ex_audio_source *source) {
 MA_API void ma_ex_audio_source_set_pan(ma_ex_audio_source *source, float value) {
     if(source != NULL) {
         source->settings.pan = value;
-        ma_sound_set_pan(&source->clip.sound, value);
+        if(ma_ex_audio_source_has_sound(source))
+            ma_sound_set_pan(&source->clip.sound, value);
     }
 }
 
@@ -734,7 +789,8 @@ MA_API float ma_ex_audio_source_get_pan(ma_ex_audio_source *source) {
 MA_API void ma_ex_audio_source_set_pan_mode(ma_ex_audio_source *source, ma_pan_mode mode) {
     if(source != NULL) {
         source->settings.panMode = mode;
-        ma_sound_set_pan_mode(&source->clip.sound, mode);
+        if(ma_ex_audio_source_has_sound(source))
+            ma_sound_set_pan_mode(&source->clip.sound, mode);
     }
 }
 
@@ -745,20 +801,20 @@ MA_API ma_pan_mode ma_ex_audio_source_get_pan_mode(ma_ex_audio_source *source) {
 }
 
 MA_API void ma_ex_audio_source_set_pcm_position(ma_ex_audio_source *source, ma_uint64 position) {
-    if(source != NULL) {
+    if(source != NULL && ma_ex_audio_source_has_sound(source)) {
         ma_sound_seek_to_pcm_frame(&source->clip.sound, position);
     }
 }
 
 MA_API ma_uint64 ma_ex_audio_source_get_pcm_position(ma_ex_audio_source *source) {
-    if(source != NULL) {
+    if(source != NULL && ma_ex_audio_source_has_sound(source)) {
         return ma_sound_get_time_in_pcm_frames(&source->clip.sound);
     }
     return 0;
 }
 
 MA_API ma_uint64 ma_ex_audio_source_get_pcm_length(ma_ex_audio_source *source) {
-    if(source != NULL) {
+    if(source != NULL && ma_ex_audio_source_has_sound(source)) {
         ma_data_source *dataSource = ma_sound_get_data_source(&source->clip.sound);
         if(dataSource != NULL) {
             ma_uint64 length = 0;
@@ -772,7 +828,8 @@ MA_API ma_uint64 ma_ex_audio_source_get_pcm_length(ma_ex_audio_source *source) {
 MA_API void ma_ex_audio_source_set_loop(ma_ex_audio_source *source, ma_bool32 loop) {
     if(source != NULL) {
         source->settings.loop = loop;
-        ma_sound_set_looping(&source->clip.sound, loop);
+        if(ma_ex_audio_source_has_sound(source))
+            ma_sound_set_looping(&source->clip.sound, loop);
     }
 }
 
@@ -785,7 +842,8 @@ MA_API ma_bool32 ma_ex_audio_source_get_loop(ma_ex_audio_source *source) {
 MA_API void ma_ex_audio_source_set_position(ma_ex_audio_source *source, float x, float y, float z) {
     if(source != NULL) {
         ma_ex_vec3f_set(&source->settings.position, x, y, z);
-        ma_sound_set_position(&source->clip.sound, x, y, z);
+        if(ma_ex_audio_source_has_sound(source))
+            ma_sound_set_position(&source->clip.sound, x, y, z);
     }
 }
 
@@ -802,7 +860,8 @@ MA_API void ma_ex_audio_source_get_position(ma_ex_audio_source *source, float *x
 MA_API void ma_ex_audio_source_set_direction(ma_ex_audio_source *source, float x, float y, float z) {
     if(source != NULL) {
         ma_ex_vec3f_set(&source->settings.direction, x, y, z);
-        ma_sound_set_direction(&source->clip.sound, x, y, z);
+        if(ma_ex_audio_source_has_sound(source))
+            ma_sound_set_direction(&source->clip.sound, x, y, z);
     }
 }
 
@@ -819,7 +878,8 @@ MA_API void ma_ex_audio_source_get_direction(ma_ex_audio_source *source, float *
 MA_API void ma_ex_audio_source_set_velocity(ma_ex_audio_source *source, float x, float y, float z) {
     if(source != NULL) {
         ma_ex_vec3f_set(&source->settings.velocity, x, y, z);
-        ma_sound_set_velocity(&source->clip.sound, x, y, z);
+        if(ma_ex_audio_source_has_sound(source))
+            ma_sound_set_velocity(&source->clip.sound, x, y, z);
     }
 }
 
@@ -836,7 +896,8 @@ MA_API void ma_ex_audio_source_get_velocity(ma_ex_audio_source *source, float *x
 MA_API void ma_ex_audio_source_set_spatialization(ma_ex_audio_source *source, ma_bool32 enabled) {
     if(source != NULL) {
         source->settings.spatialization = enabled;
-        ma_sound_set_spatialization_enabled(&source->clip.sound, enabled);
+        if(ma_ex_audio_source_has_sound(source))
+            ma_sound_set_spatialization_enabled(&source->clip.sound, enabled);
     }
 }
 
@@ -849,7 +910,8 @@ MA_API ma_bool32 ma_ex_audio_source_get_spatialization(ma_ex_audio_source *sourc
 MA_API void ma_ex_audio_source_set_attenuation_model(ma_ex_audio_source *source, ma_attenuation_model model) {
     if(source != NULL) {
         source->settings.attenuationModel = model;
-        ma_sound_set_attenuation_model(&source->clip.sound, model);
+        if(ma_ex_audio_source_has_sound(source))
+            ma_sound_set_attenuation_model(&source->clip.sound, model);
     }
 }
 
@@ -862,7 +924,8 @@ MA_API ma_attenuation_model ma_ex_audio_source_get_attenuation_model(ma_ex_audio
 MA_API void ma_ex_audio_source_set_doppler_factor(ma_ex_audio_source *source, float factor) {
     if(source != NULL) {
         source->settings.dopplerFactor = factor;
-        ma_sound_set_doppler_factor(&source->clip.sound, factor);
+        if(ma_ex_audio_source_has_sound(source))
+            ma_sound_set_doppler_factor(&source->clip.sound, factor);
     }
 }
 
@@ -875,7 +938,8 @@ MA_API float ma_ex_audio_source_get_doppler_factor(ma_ex_audio_source *source) {
 MA_API void ma_ex_audio_source_set_min_distance(ma_ex_audio_source *source, float distance) {
     if(source != NULL) {
         source->settings.minDistance = distance;
-        ma_sound_set_min_distance(&source->clip.sound, distance);
+        if(ma_ex_audio_source_has_sound(source))
+            ma_sound_set_min_distance(&source->clip.sound, distance);
     }
 }
 
@@ -888,7 +952,8 @@ MA_API float ma_ex_audio_source_get_min_distance(ma_ex_audio_source *source) {
 MA_API void ma_ex_audio_source_set_max_distance(ma_ex_audio_source *source, float distance) {
     if(source != NULL) {
         source->settings.maxDistance = distance;
-        ma_sound_set_max_distance(&source->clip.sound, distance);
+        if(ma_ex_audio_source_has_sound(source))
+            ma_sound_set_max_distance(&source->clip.sound, distance);
     }
 }
 
@@ -899,14 +964,14 @@ MA_API float ma_ex_audio_source_get_max_distance(ma_ex_audio_source *source) {
 }
 
 MA_API ma_bool32 ma_ex_audio_source_get_is_playing(ma_ex_audio_source *source) {
-    if(source != NULL) {
+    if(source != NULL && ma_ex_audio_source_has_sound(source)) {
         return ma_sound_is_playing(&source->clip.sound);
     }
     return MA_FALSE;
 }
 
 MA_API ma_bool32 ma_ex_audio_source_get_is_at_end(ma_ex_audio_source *source) {
-    if(source != NULL) {
+    if(source != NULL && ma_ex_audio_source_has_sound(source)) {
         return ma_sound_at_end(&source->clip.sound);
     }
     return MA_FALSE;

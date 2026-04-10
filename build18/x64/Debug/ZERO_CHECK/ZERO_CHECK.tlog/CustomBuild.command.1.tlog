@@ -1,0 +1,10 @@
+^D:\MINIAUDIOEX\BUILD18\CMAKEFILES\67C98FCE163A875ED0C59C0E04935FED\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/miniaudioex -BD:/miniaudioex/build18 --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file D:/miniaudioex/build18/miniaudioex.slnx
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
