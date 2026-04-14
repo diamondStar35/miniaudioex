@@ -7682,6 +7682,7 @@ typedef enum {
     ma_allocation_type_device_descriptor,
     ma_allocation_type_device_info,
     ma_allocation_type_effect_node,
+    ma_allocation_type_encoder,
     ma_allocation_type_engine,
     ma_allocation_type_fader,
     ma_allocation_type_fence,

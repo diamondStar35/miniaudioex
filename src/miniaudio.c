@@ -68685,6 +68685,8 @@ MA_API size_t ma_get_size_of_type(ma_allocation_type type) {
             return sizeof(ma_device_info);
         case ma_allocation_type_effect_node:
             return sizeof(ma_effect_node);
+        case ma_allocation_type_encoder:
+            return sizeof(ma_encoder);
         case ma_allocation_type_engine:
             return sizeof(ma_engine);
         case ma_allocation_type_fader:
