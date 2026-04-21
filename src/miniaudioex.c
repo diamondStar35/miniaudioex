@@ -120,7 +120,7 @@ static void ma_ex_update_aaudio_diagnostics(
     diagnostics->aaudioPerformanceMode = -1;
     diagnostics->xRunCount = -1;
 
-#ifdef MA_SUPPORT_AAUDIO
+#ifdef MA_HAS_AAUDIO
     if(diagnostics->isAAudio) {
         ma_AAudioStream *pStream = (ma_AAudioStream *)context->device.aaudio.pStreamPlayback;
 
