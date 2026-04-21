@@ -148,11 +148,22 @@ struct ma_ex_context {
     ma_device device;
     ma_engine engine;
     ma_resource_manager resourceManager;
+    ma_device_data_proc deviceDataProc;
     ma_uint32 sampleRate;
     ma_uint8 channels;
     ma_format format;
     ma_int32 listeners[MA_ENGINE_MAX_LISTENERS];
+    ma_uint64 traceId;
+    ma_atomic_uint32 activeCallbackCount;
+    ma_atomic_uint32 callbackCount;
+    ma_atomic_uint32 uninitStarted;
+    ma_uint64 lastCallbackThreadId;
     ma_ex_aaudio_diagnostics aaudioDiagnostics;
+    ma_bool32 traceUninitStarted;
+    ma_uint32 traceActiveCallbacks;
+    ma_uint32 traceCallbackOrdinal;
+    ma_uint64 traceLastLoggedCallbackThreadId;
+    struct ma_ex_context *traceNext;
 };
 
 typedef struct ma_ex_audio_source_settings ma_ex_audio_source_settings;
@@ -188,6 +199,7 @@ struct ma_ex_audio_source {
     ma_ex_audio_clip clip;
     ma_ex_audio_source_settings settings;
     ma_sound_group *group;
+    ma_uint64 traceId;
 };
 
 typedef struct ma_ex_audio_listener_settings ma_ex_audio_listener_settings;

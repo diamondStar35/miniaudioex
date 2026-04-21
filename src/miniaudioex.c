@@ -54,6 +54,19 @@
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
+#include <stdarg.h>
+#include <time.h>
+#if defined(_WIN32)
+    #include <io.h>
+    #include <process.h>
+    #include <windows.h>
+#else
+    #include <unistd.h>
+#endif
+#if defined(__linux__) || defined(__ANDROID__)
+    #include <sys/types.h>
+    #include <sys/syscall.h>
+#endif
 #ifdef MA_HAS_AAUDIO
     #include <dlfcn.h>
 #endif
@@ -200,6 +213,446 @@ static void ma_ex_update_aaudio_diagnostics(
     #endif
 #endif
 
+#define MA_EX_TRACE_ENABLE_ENV "MA_EX_TRACE_ENABLE"
+#define MA_EX_TRACE_FD_ENV "MA_EX_TRACE_FD"
+#define MA_EX_TRACE_PATH_ENV "MA_EX_TRACE_PATH"
+#define MA_EX_TRACE_CALLBACK_WARMUP_ENV "MA_EX_TRACE_CALLBACK_WARMUP"
+#define MA_EX_TRACE_CALLBACK_EVERY_ENV "MA_EX_TRACE_CALLBACK_EVERY"
+#define MA_EX_TRACE_DEFAULT_CALLBACK_WARMUP 96
+#define MA_EX_TRACE_DEFAULT_CALLBACK_EVERY 256
+
+typedef struct ma_ex_trace_state ma_ex_trace_state;
+
+struct ma_ex_trace_state {
+    ma_bool32 bootstrapped;
+    ma_bool32 active;
+    ma_bool32 mutexInitialized;
+    ma_mutex mutex;
+    FILE *file;
+    ma_uint64 nextContextId;
+    ma_uint64 nextSourceId;
+    ma_uint32 callbackWarmup;
+    ma_uint32 callbackEvery;
+    ma_ex_context *contexts;
+};
+
+static ma_ex_trace_state g_ma_ex_trace;
+
+static ma_bool32 ma_ex_trace_is_truthy(const char *value)
+{
+    if(value == NULL)
+        return MA_FALSE;
+
+    while(*value == ' ' || *value == '\t' || *value == '\r' || *value == '\n') {
+        value += 1;
+    }
+
+    if(*value == '\0')
+        return MA_FALSE;
+
+    if(strcmp(value, "0") == 0 || strcmp(value, "false") == 0 || strcmp(value, "FALSE") == 0)
+        return MA_FALSE;
+
+    return MA_TRUE;
+}
+
+static ma_uint32 ma_ex_trace_parse_env_u32(const char *name, ma_uint32 defaultValue)
+{
+    char *end;
+    const char *text = getenv(name);
+    unsigned long value;
+
+    if(text == NULL || text[0] == '\0')
+        return defaultValue;
+
+    value = strtoul(text, &end, 10);
+    if(end == text || *end != '\0')
+        return defaultValue;
+
+    if(value > 0xFFFFFFFFUL)
+        value = 0xFFFFFFFFUL;
+
+    return (ma_uint32)value;
+}
+
+static ma_uint64 ma_ex_trace_get_timestamp_ms(void)
+{
+#if defined(_WIN32)
+    FILETIME fileTime;
+    ULARGE_INTEGER timeValue;
+    GetSystemTimeAsFileTime(&fileTime);
+    timeValue.LowPart = fileTime.dwLowDateTime;
+    timeValue.HighPart = fileTime.dwHighDateTime;
+    return (ma_uint64)((timeValue.QuadPart - 116444736000000000ULL) / 10000ULL);
+#else
+    struct timespec ts;
+    if(clock_gettime(CLOCK_REALTIME, &ts) != 0)
+        return 0;
+    return ((ma_uint64)ts.tv_sec * 1000ULL) + ((ma_uint64)ts.tv_nsec / 1000000ULL);
+#endif
+}
+
+static ma_uint64 ma_ex_trace_get_process_id(void)
+{
+#if defined(_WIN32)
+    return (ma_uint64)_getpid();
+#else
+    return (ma_uint64)getpid();
+#endif
+}
+
+static ma_uint64 ma_ex_trace_get_thread_id(void)
+{
+#if defined(_WIN32)
+    return (ma_uint64)GetCurrentThreadId();
+#elif defined(__linux__) || defined(__ANDROID__)
+    return (ma_uint64)syscall(SYS_gettid);
+#else
+    return (ma_uint64)ma_ex_trace_get_process_id();
+#endif
+}
+
+static FILE *ma_ex_trace_open_stream(void)
+{
+    char *end;
+    const char *fdText = getenv(MA_EX_TRACE_FD_ENV);
+    const char *path = getenv(MA_EX_TRACE_PATH_ENV);
+
+    if(fdText != NULL && fdText[0] != '\0') {
+        long fd = strtol(fdText, &end, 10);
+        if(end != fdText && *end == '\0' && fd >= 0) {
+#if defined(_WIN32)
+            return _fdopen((int)fd, "a");
+#else
+            return fdopen((int)fd, "a");
+#endif
+        }
+    }
+
+    if(path != NULL && path[0] != '\0')
+        return fopen(path, "a");
+
+    return NULL;
+}
+
+static void ma_ex_trace_write_unlocked(const char *category, const char *format, va_list args)
+{
+    if(g_ma_ex_trace.active == MA_FALSE || g_ma_ex_trace.file == NULL)
+        return;
+
+    fprintf(
+        g_ma_ex_trace.file,
+        "%llu | pid=%llu tid=%llu | %s | ",
+        (unsigned long long)ma_ex_trace_get_timestamp_ms(),
+        (unsigned long long)ma_ex_trace_get_process_id(),
+        (unsigned long long)ma_ex_trace_get_thread_id(),
+        category != NULL ? category : "trace");
+    vfprintf(g_ma_ex_trace.file, format, args);
+    fputc('\n', g_ma_ex_trace.file);
+    fflush(g_ma_ex_trace.file);
+}
+
+static void ma_ex_trace_write(const char *category, const char *format, ...)
+{
+    va_list args;
+
+    if(g_ma_ex_trace.active == MA_FALSE || g_ma_ex_trace.mutexInitialized == MA_FALSE)
+        return;
+
+    ma_mutex_lock(&g_ma_ex_trace.mutex);
+    va_start(args, format);
+    ma_ex_trace_write_unlocked(category, format, args);
+    va_end(args);
+    ma_mutex_unlock(&g_ma_ex_trace.mutex);
+}
+
+static void ma_ex_trace_bootstrap(void)
+{
+    const char *enableText;
+    FILE *stream;
+
+    if(g_ma_ex_trace.bootstrapped == MA_TRUE)
+        return;
+
+    MA_ZERO_OBJECT(&g_ma_ex_trace);
+    g_ma_ex_trace.bootstrapped = MA_TRUE;
+
+    enableText = getenv(MA_EX_TRACE_ENABLE_ENV);
+    if(ma_ex_trace_is_truthy(enableText) == MA_FALSE
+        && getenv(MA_EX_TRACE_FD_ENV) == NULL
+        && getenv(MA_EX_TRACE_PATH_ENV) == NULL) {
+        return;
+    }
+
+    if(ma_mutex_init(&g_ma_ex_trace.mutex) != MA_SUCCESS)
+        return;
+
+    g_ma_ex_trace.mutexInitialized = MA_TRUE;
+    g_ma_ex_trace.callbackWarmup = ma_ex_trace_parse_env_u32(MA_EX_TRACE_CALLBACK_WARMUP_ENV, MA_EX_TRACE_DEFAULT_CALLBACK_WARMUP);
+    g_ma_ex_trace.callbackEvery = ma_ex_trace_parse_env_u32(MA_EX_TRACE_CALLBACK_EVERY_ENV, MA_EX_TRACE_DEFAULT_CALLBACK_EVERY);
+    g_ma_ex_trace.nextContextId = 1;
+    g_ma_ex_trace.nextSourceId = 1;
+
+    stream = ma_ex_trace_open_stream();
+    if(stream == NULL)
+        return;
+
+    g_ma_ex_trace.file = stream;
+    setvbuf(g_ma_ex_trace.file, NULL, _IOLBF, 0);
+    g_ma_ex_trace.active = MA_TRUE;
+    ma_ex_trace_write(
+        "trace",
+        "enabled=1 callbackWarmup=%u callbackEvery=%u fd=%s path=%s",
+        (unsigned int)g_ma_ex_trace.callbackWarmup,
+        (unsigned int)g_ma_ex_trace.callbackEvery,
+        getenv(MA_EX_TRACE_FD_ENV) != NULL ? getenv(MA_EX_TRACE_FD_ENV) : "<none>",
+        getenv(MA_EX_TRACE_PATH_ENV) != NULL ? getenv(MA_EX_TRACE_PATH_ENV) : "<none>");
+}
+
+static ma_bool32 ma_ex_trace_is_active(void)
+{
+    return g_ma_ex_trace.active;
+}
+
+static ma_ex_context *ma_ex_trace_find_context_unlocked(ma_device *pDevice)
+{
+    ma_ex_context *current = g_ma_ex_trace.contexts;
+
+    while(current != NULL) {
+        if(&current->device == pDevice)
+            return current;
+
+        current = current->traceNext;
+    }
+
+    return NULL;
+}
+
+static void ma_ex_trace_register_context(ma_ex_context *context)
+{
+    if(context == NULL || ma_ex_trace_is_active() == MA_FALSE)
+        return;
+
+    ma_mutex_lock(&g_ma_ex_trace.mutex);
+    context->traceId = g_ma_ex_trace.nextContextId++;
+    context->traceNext = g_ma_ex_trace.contexts;
+    g_ma_ex_trace.contexts = context;
+    fprintf(
+        g_ma_ex_trace.file,
+        "%llu | pid=%llu tid=%llu | context | register context=%llu contextPtr=%p devicePtr=%p enginePtr=%p sampleRate=%u channels=%u format=%d\n",
+        (unsigned long long)ma_ex_trace_get_timestamp_ms(),
+        (unsigned long long)ma_ex_trace_get_process_id(),
+        (unsigned long long)ma_ex_trace_get_thread_id(),
+        (unsigned long long)context->traceId,
+        (void*)context,
+        (void*)&context->device,
+        (void*)&context->engine,
+        (unsigned int)context->sampleRate,
+        (unsigned int)context->channels,
+        (int)context->format);
+    fflush(g_ma_ex_trace.file);
+    ma_mutex_unlock(&g_ma_ex_trace.mutex);
+}
+
+static void ma_ex_trace_unregister_context(ma_ex_context *context)
+{
+    ma_ex_context *previous;
+    ma_ex_context *current;
+
+    if(context == NULL || ma_ex_trace_is_active() == MA_FALSE)
+        return;
+
+    ma_mutex_lock(&g_ma_ex_trace.mutex);
+    previous = NULL;
+    current = g_ma_ex_trace.contexts;
+
+    while(current != NULL) {
+        if(current == context) {
+            if(previous == NULL) {
+                g_ma_ex_trace.contexts = current->traceNext;
+            } else {
+                previous->traceNext = current->traceNext;
+            }
+
+            context->traceNext = NULL;
+            fprintf(
+                g_ma_ex_trace.file,
+                "%llu | pid=%llu tid=%llu | context | unregister context=%llu contextPtr=%p devicePtr=%p activeCallbacks=%u callbacks=%u uninitStarted=%u\n",
+                (unsigned long long)ma_ex_trace_get_timestamp_ms(),
+                (unsigned long long)ma_ex_trace_get_process_id(),
+                (unsigned long long)ma_ex_trace_get_thread_id(),
+                (unsigned long long)context->traceId,
+                (void*)context,
+                (void*)&context->device,
+                (unsigned int)context->traceActiveCallbacks,
+                (unsigned int)context->traceCallbackOrdinal,
+                (unsigned int)context->traceUninitStarted);
+            fflush(g_ma_ex_trace.file);
+            break;
+        }
+
+        previous = current;
+        current = current->traceNext;
+    }
+
+    ma_mutex_unlock(&g_ma_ex_trace.mutex);
+}
+
+static ma_uint64 ma_ex_trace_allocate_source_id(void)
+{
+    ma_uint64 traceId = 0;
+
+    if(ma_ex_trace_is_active() == MA_FALSE)
+        return 0;
+
+    ma_mutex_lock(&g_ma_ex_trace.mutex);
+    traceId = g_ma_ex_trace.nextSourceId++;
+    ma_mutex_unlock(&g_ma_ex_trace.mutex);
+    return traceId;
+}
+
+static void ma_ex_trace_log_aaudio_snapshot(ma_ex_context *context, const char *stage)
+{
+    const ma_ex_aaudio_diagnostics *diagnostics;
+
+    if(context == NULL || ma_ex_trace_is_active() == MA_FALSE)
+        return;
+
+    diagnostics = &context->aaudioDiagnostics;
+    ma_ex_trace_write(
+        "aaudio",
+        "stage=%s context=%llu backend=%d isAAudio=%u usage=%d contentType=%d shareRequested=%d shareActual=%d fallback=%u perf=%d state=%d format=%d channels=%u sampleRate=%u requestedPeriod=%u internalPeriod=%u internalPeriods=%u streamState=%d bufferCapacity=%d framesPerCallback=%d framesPerBurst=%d sharingMode=%d perfMode=%d xRuns=%d exclusiveResult=%d sharedResult=%d",
+        stage != NULL ? stage : "unknown",
+        (unsigned long long)context->traceId,
+        (int)diagnostics->backend,
+        (unsigned int)diagnostics->isAAudio,
+        (int)diagnostics->usage,
+        (int)diagnostics->contentType,
+        (int)diagnostics->requestedShareMode,
+        (int)diagnostics->actualShareMode,
+        (unsigned int)diagnostics->usedSharedFallback,
+        (int)diagnostics->performanceProfile,
+        (int)diagnostics->deviceState,
+        (int)diagnostics->format,
+        (unsigned int)diagnostics->channels,
+        (unsigned int)diagnostics->sampleRate,
+        (unsigned int)diagnostics->requestedPeriodSizeInFrames,
+        (unsigned int)diagnostics->internalPeriodSizeInFrames,
+        (unsigned int)diagnostics->internalPeriods,
+        diagnostics->streamState,
+        diagnostics->bufferCapacityInFrames,
+        diagnostics->framesPerDataCallback,
+        diagnostics->framesPerBurst,
+        diagnostics->aaudioSharingMode,
+        diagnostics->aaudioPerformanceMode,
+        diagnostics->xRunCount,
+        (int)diagnostics->exclusiveInitResult,
+        (int)diagnostics->sharedInitResult);
+}
+
+static ma_bool32 ma_ex_trace_callback_should_log(ma_ex_context *context, ma_uint64 threadId)
+{
+    if(context == NULL)
+        return MA_FALSE;
+
+    if(context->traceCallbackOrdinal <= g_ma_ex_trace.callbackWarmup)
+        return MA_TRUE;
+
+    if(context->traceActiveCallbacks > 1)
+        return MA_TRUE;
+
+    if(context->traceUninitStarted)
+        return MA_TRUE;
+
+    if(g_ma_ex_trace.callbackEvery > 0 && (context->traceCallbackOrdinal % g_ma_ex_trace.callbackEvery) == 0)
+        return MA_TRUE;
+
+    if(context->traceLastLoggedCallbackThreadId != threadId)
+        return MA_TRUE;
+
+    return MA_FALSE;
+}
+
+static ma_ex_context *ma_ex_trace_on_callback_enter(ma_device *pDevice, ma_uint32 frameCount, ma_uint64 *threadIdOut, ma_uint32 *ordinalOut, ma_bool32 *shouldLogOut)
+{
+    ma_ex_context *context;
+    ma_uint64 threadId;
+    ma_bool32 shouldLog;
+
+    if(threadIdOut != NULL)
+        *threadIdOut = 0;
+    if(ordinalOut != NULL)
+        *ordinalOut = 0;
+    if(shouldLogOut != NULL)
+        *shouldLogOut = MA_FALSE;
+
+    if(ma_ex_trace_is_active() == MA_FALSE)
+        return NULL;
+
+    threadId = ma_ex_trace_get_thread_id();
+    ma_mutex_lock(&g_ma_ex_trace.mutex);
+    context = ma_ex_trace_find_context_unlocked(pDevice);
+    if(context != NULL) {
+        context->traceActiveCallbacks += 1;
+        context->traceCallbackOrdinal += 1;
+        shouldLog = ma_ex_trace_callback_should_log(context, threadId);
+        if(shouldLog) {
+            context->traceLastLoggedCallbackThreadId = threadId;
+            fprintf(
+                g_ma_ex_trace.file,
+                "%llu | pid=%llu tid=%llu | callback | enter context=%llu devicePtr=%p frames=%u ordinal=%u active=%u uninit=%u enginePtr=%p dataProc=%p\n",
+                (unsigned long long)ma_ex_trace_get_timestamp_ms(),
+                (unsigned long long)ma_ex_trace_get_process_id(),
+                (unsigned long long)threadId,
+                (unsigned long long)context->traceId,
+                (void*)pDevice,
+                (unsigned int)frameCount,
+                (unsigned int)context->traceCallbackOrdinal,
+                (unsigned int)context->traceActiveCallbacks,
+                (unsigned int)context->traceUninitStarted,
+                (void*)&context->engine,
+                (void*)context->deviceDataProc);
+            fflush(g_ma_ex_trace.file);
+        }
+
+        if(threadIdOut != NULL)
+            *threadIdOut = threadId;
+        if(ordinalOut != NULL)
+            *ordinalOut = context->traceCallbackOrdinal;
+        if(shouldLogOut != NULL)
+            *shouldLogOut = shouldLog;
+    }
+    ma_mutex_unlock(&g_ma_ex_trace.mutex);
+    return context;
+}
+
+static void ma_ex_trace_on_callback_exit(ma_ex_context *context, ma_device *pDevice, ma_uint32 frameCount, ma_uint64 threadId, ma_uint32 ordinal, ma_bool32 shouldLog)
+{
+    if(context == NULL || ma_ex_trace_is_active() == MA_FALSE)
+        return;
+
+    ma_mutex_lock(&g_ma_ex_trace.mutex);
+    if(context->traceActiveCallbacks > 0)
+        context->traceActiveCallbacks -= 1;
+
+    if(shouldLog || context->traceUninitStarted) {
+        fprintf(
+            g_ma_ex_trace.file,
+            "%llu | pid=%llu tid=%llu | callback | exit context=%llu devicePtr=%p frames=%u ordinal=%u active=%u uninit=%u\n",
+            (unsigned long long)ma_ex_trace_get_timestamp_ms(),
+            (unsigned long long)ma_ex_trace_get_process_id(),
+            (unsigned long long)threadId,
+            (unsigned long long)context->traceId,
+            (void*)pDevice,
+            (unsigned int)frameCount,
+            (unsigned int)ordinal,
+            (unsigned int)context->traceActiveCallbacks,
+            (unsigned int)context->traceUninitStarted);
+        fflush(g_ma_ex_trace.file);
+    }
+    ma_mutex_unlock(&g_ma_ex_trace.mutex);
+}
+
 static MA_INLINE ma_uint64 ma_ex_create_hashcode(const void *data, size_t size) {
     ma_uint8 *d = (ma_uint8*)data;
     ma_uint64 hash = 0;
@@ -246,7 +699,23 @@ static ma_uint32 ma_next_power_of_two(ma_uint32 value) {
 }
 
 static void ma_ex_on_data_proc(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
-    ma_engine_read_pcm_frames((ma_engine *)pDevice->pUserData, pOutput, frameCount, NULL);
+    ma_ex_context *context;
+    ma_uint64 threadId = 0;
+    ma_uint32 ordinal = 0;
+    ma_bool32 shouldLog = MA_FALSE;
+    ma_device_data_proc dataProc = NULL;
+
+    context = ma_ex_trace_on_callback_enter(pDevice, frameCount, &threadId, &ordinal, &shouldLog);
+    if(context != NULL)
+        dataProc = context->deviceDataProc;
+
+    if(dataProc != NULL) {
+        dataProc(pDevice, pOutput, pInput, frameCount);
+    } else {
+        ma_engine_read_pcm_frames((ma_engine *)pDevice->pUserData, pOutput, frameCount, NULL);
+    }
+
+    ma_ex_trace_on_callback_exit(context, pDevice, frameCount, threadId, ordinal, shouldLog);
     (void)pInput;
 }
 
@@ -407,6 +876,9 @@ static ma_ex_context *ma_ex_context_init_internal(const ma_ex_context_config *co
     ma_share_mode requestedShareMode;
     ma_share_mode actualShareMode;
     ma_bool32 usedSharedFallback = MA_FALSE;
+    void *tracePlaybackStream = NULL;
+
+    ma_ex_trace_bootstrap();
 
     ma_ex_context *context = MA_MALLOC(sizeof(ma_ex_context));
     MA_ZERO_OBJECT(context);
@@ -418,9 +890,11 @@ static ma_ex_context *ma_ex_context_init_internal(const ma_ex_context_config *co
     context->sampleRate = config->sampleRate;
     context->channels = config->channels;
     context->format = ma_format_f32;
+    context->deviceDataProc = config->deviceDataProc;
 
     if (ma_context_init(NULL, 0, NULL, &context->context) != MA_SUCCESS) {
         fprintf(stderr, "Failed to initialize ma_context\n");
+        ma_ex_trace_write("context-init", "stage=ma_context_init failed");
         MA_FREE(context);
         return NULL;
     }
@@ -429,7 +903,7 @@ static ma_ex_context *ma_ex_context_init_internal(const ma_ex_context_config *co
     deviceConfig.playback.format = context->format;
     deviceConfig.playback.channels = context->channels;
     deviceConfig.sampleRate = context->sampleRate;
-    deviceConfig.dataCallback = config->deviceDataProc == NULL ? &ma_ex_on_data_proc : config->deviceDataProc;
+    deviceConfig.dataCallback = &ma_ex_on_data_proc;
     deviceConfig.periodSizeInFrames = config->periodSizeInFrames;
     deviceConfig.performanceProfile = ma_performance_profile_low_latency;
     deviceConfig.playback.shareMode = aaudioConfig->playbackShareMode;
@@ -447,6 +921,7 @@ static ma_ex_context *ma_ex_context_init_internal(const ma_ex_context_config *co
 
     if (ma_context_get_devices(&context->context, &pPlaybackInfos, &playbackCount, &pCaptureInfos, &captureCount) != MA_SUCCESS) {
         fprintf(stderr, "Failed to get playback devices\n");
+        ma_ex_trace_write("context-init", "stage=ma_context_get_devices failed");
         ma_context_uninit(&context->context);
         MA_FREE(context);
         return NULL;
@@ -454,6 +929,11 @@ static ma_ex_context *ma_ex_context_init_internal(const ma_ex_context_config *co
 
     if(config->deviceInfo.index >= (ma_int32)playbackCount) {
         fprintf(stderr, "Device index is greater than or equal to the number of playback devices\n");
+        ma_ex_trace_write(
+            "context-init",
+            "stage=validate-device-index failed requested=%d available=%u",
+            (int)config->deviceInfo.index,
+            (unsigned int)playbackCount);
         ma_context_uninit(&context->context);
         MA_FREE(context);
         return NULL;
@@ -468,6 +948,16 @@ static ma_ex_context *ma_ex_context_init_internal(const ma_ex_context_config *co
     deviceConfig.playback.pDeviceID = pSelectedDevice;
 
     result = ma_device_init(&context->context, &deviceConfig, &context->device);
+    ma_ex_trace_write(
+        "context-init",
+        "stage=ma_device_init result=%d requestedShareMode=%d sampleRate=%u channels=%u periodSize=%u selectedDeviceIndex=%d callback=%p",
+        (int)result,
+        (int)requestedShareMode,
+        (unsigned int)context->sampleRate,
+        (unsigned int)context->channels,
+        (unsigned int)config->periodSizeInFrames,
+        (int)config->deviceInfo.index,
+        (void*)context->deviceDataProc);
 
     if(requestedShareMode == ma_share_mode_exclusive) {
         exclusiveInitResult = result;
@@ -481,6 +971,10 @@ static ma_ex_context *ma_ex_context_init_internal(const ma_ex_context_config *co
 
         result = ma_device_init(&context->context, &sharedDeviceConfig, &context->device);
         sharedInitResult = result;
+        ma_ex_trace_write(
+            "context-init",
+            "stage=ma_device_init_shared_fallback result=%d",
+            (int)result);
 
         if(result == MA_SUCCESS) {
             deviceConfig = sharedDeviceConfig;
@@ -491,6 +985,7 @@ static ma_ex_context *ma_ex_context_init_internal(const ma_ex_context_config *co
 
     if(result != MA_SUCCESS) {
         fprintf(stderr, "Failed to initialize ma_device\n");
+        ma_ex_trace_write("context-init", "stage=ma_device_init failed result=%d", (int)result);
         ma_context_uninit(&context->context);
         MA_FREE(context);
         return NULL;
@@ -506,6 +1001,7 @@ static ma_ex_context *ma_ex_context_init_internal(const ma_ex_context_config *co
 
     if (ma_resource_manager_init(&resourceManagerConfig, &context->resourceManager) != MA_SUCCESS) {
         fprintf(stderr, "Failed to initialize ma_resource_manager\n");
+        ma_ex_trace_write("context-init", "stage=ma_resource_manager_init failed");
         ma_context_uninit(&context->context);
         MA_FREE(context);
         return NULL;
@@ -518,6 +1014,7 @@ static ma_ex_context *ma_ex_context_init_internal(const ma_ex_context_config *co
 
     if(ma_engine_init(&engineConfig, &context->engine) != MA_SUCCESS) {
         fprintf(stderr, "Failed to initialize ma_engine\n");
+        ma_ex_trace_write("context-init", "stage=ma_engine_init failed");
         ma_device_uninit(&context->device);
         ma_context_uninit(&context->context);
         MA_FREE(context);
@@ -525,9 +1022,12 @@ static ma_ex_context *ma_ex_context_init_internal(const ma_ex_context_config *co
     }
 
     context->device.pUserData = &context->engine;
+    ma_ex_trace_register_context(context);
 
     if (ma_device_start(&context->device) != MA_SUCCESS) {
         fprintf(stderr, "Failed to start ma_device\n");
+        ma_ex_trace_write("context-init", "stage=ma_device_start failed context=%llu", (unsigned long long)context->traceId);
+        ma_ex_trace_unregister_context(context);
         ma_engine_uninit(&context->engine);
         ma_device_uninit(&context->device);
         ma_context_uninit(&context->context);
@@ -548,6 +1048,22 @@ static ma_ex_context *ma_ex_context_init_internal(const ma_ex_context_config *co
     for(size_t i = 0; i < MA_ENGINE_MAX_LISTENERS; i++) {
         context->listeners[i] = -1;
     }
+
+#ifdef MA_HAS_AAUDIO
+    tracePlaybackStream = context->device.aaudio.pStreamPlayback;
+#endif
+
+    ma_ex_trace_write(
+        "context-init",
+        "stage=ready context=%llu requestedShareMode=%d actualShareMode=%d sharedFallback=%u playbackDevice=%p streamPlayback=%p resourceManager=%p",
+        (unsigned long long)context->traceId,
+        (int)requestedShareMode,
+        (int)actualShareMode,
+        (unsigned int)usedSharedFallback,
+        (void*)&context->device,
+        tracePlaybackStream,
+        (void*)&context->resourceManager);
+    ma_ex_trace_log_aaudio_snapshot(context, "ready");
 
     return context;
 }
@@ -570,10 +1086,28 @@ MA_API ma_ex_context *ma_ex_context_init_ex(const ma_ex_context_config *config, 
 
 MA_API void ma_ex_context_uninit(ma_ex_context *context) {
     if(context != NULL) {
+        context->traceUninitStarted = MA_TRUE;
+        ma_ex_trace_write(
+            "context-uninit",
+            "stage=begin context=%llu activeCallbacks=%u callbacks=%u deviceState=%d",
+            (unsigned long long)context->traceId,
+            (unsigned int)context->traceActiveCallbacks,
+            (unsigned int)context->traceCallbackOrdinal,
+            (int)ma_device_get_state(&context->device));
+        ma_ex_trace_log_aaudio_snapshot(context, "before-uninit");
+        ma_ex_trace_write("context-uninit", "stage=engine-uninit-begin context=%llu", (unsigned long long)context->traceId);
         ma_engine_uninit(&context->engine);
+        ma_ex_trace_write("context-uninit", "stage=engine-uninit-end context=%llu", (unsigned long long)context->traceId);
+        ma_ex_trace_write("context-uninit", "stage=resource-manager-uninit-begin context=%llu", (unsigned long long)context->traceId);
         ma_resource_manager_uninit(&context->resourceManager);
+        ma_ex_trace_write("context-uninit", "stage=resource-manager-uninit-end context=%llu", (unsigned long long)context->traceId);
+        ma_ex_trace_write("context-uninit", "stage=device-uninit-begin context=%llu", (unsigned long long)context->traceId);
         ma_device_uninit(&context->device);
+        ma_ex_trace_write("context-uninit", "stage=device-uninit-end context=%llu", (unsigned long long)context->traceId);
+        ma_ex_trace_write("context-uninit", "stage=context-uninit-begin context=%llu", (unsigned long long)context->traceId);
         ma_context_uninit(&context->context);
+        ma_ex_trace_write("context-uninit", "stage=context-uninit-end context=%llu", (unsigned long long)context->traceId);
+        ma_ex_trace_unregister_context(context);
         MA_FREE(context);
     }
 }
@@ -651,11 +1185,29 @@ MA_API ma_ex_audio_clip *ma_ex_audio_clip_init_from_file(ma_ex_context *context,
     ma_result result = ma_sound_init_from_file(&context->engine, filePath, flags, NULL, NULL, &clip->sound);
 
     if(result != MA_SUCCESS) {
+        ma_ex_trace_write(
+            "clip",
+            "stage=init-from-file failed context=%llu file=%s stream=%u result=%d flags=%u",
+            (unsigned long long)context->traceId,
+            filePath,
+            (unsigned int)streamFromDisk,
+            (int)result,
+            (unsigned int)flags);
         ma_sound_uninit(&clip->sound);
         MA_FREE(clip);
         return NULL;
     }
 
+    ma_ex_trace_write(
+        "clip",
+        "stage=init-from-file context=%llu clipPtr=%p file=%s stream=%u hash=%llu flags=%u dataSource=%p",
+        (unsigned long long)context->traceId,
+        (void*)clip,
+        filePath,
+        (unsigned int)streamFromDisk,
+        (unsigned long long)clip->soundHash,
+        (unsigned int)clip->flags,
+        (void*)ma_sound_get_data_source(&clip->sound));
     return clip;
 }
 
@@ -680,11 +1232,29 @@ MA_API ma_ex_audio_clip *ma_ex_audio_clip_init_from_memory(ma_ex_context *contex
     ma_result result = ma_sound_init_from_memory(&context->engine, data, dataSize, flags, NULL, NULL, &clip->sound);
 
     if(result != MA_SUCCESS) {
+        ma_ex_trace_write(
+            "clip",
+            "stage=init-from-memory failed context=%llu data=%p dataSize=%llu result=%d flags=%u",
+            (unsigned long long)context->traceId,
+            data,
+            (unsigned long long)dataSize,
+            (int)result,
+            (unsigned int)flags);
         ma_sound_uninit(&clip->sound);
         MA_FREE(clip);
         return NULL;
     }
 
+    ma_ex_trace_write(
+        "clip",
+        "stage=init-from-memory context=%llu clipPtr=%p data=%p dataSize=%llu hash=%llu flags=%u dataSource=%p",
+        (unsigned long long)context->traceId,
+        (void*)clip,
+        data,
+        (unsigned long long)dataSize,
+        (unsigned long long)clip->soundHash,
+        (unsigned int)clip->flags,
+        (void*)ma_sound_get_data_source(&clip->sound));
     return clip;
 }
 
@@ -708,16 +1278,39 @@ MA_API ma_ex_audio_clip *ma_ex_audio_clip_init_from_callback(ma_ex_context *cont
     ma_result result = ma_sound_init_from_callback(&context->engine, pConfig, flags, NULL, NULL, &clip->sound);
 
     if(result != MA_SUCCESS) {
+        ma_ex_trace_write(
+            "clip",
+            "stage=init-from-callback failed context=%llu callback=%p userData=%p result=%d",
+            (unsigned long long)context->traceId,
+            (void*)pConfig->callback,
+            pConfig->pUserData,
+            (int)result);
         ma_sound_uninit(&clip->sound);
         MA_FREE(clip);
         return NULL;
     }
 
+    ma_ex_trace_write(
+        "clip",
+        "stage=init-from-callback context=%llu clipPtr=%p callback=%p userData=%p hash=%llu flags=%u dataSource=%p",
+        (unsigned long long)context->traceId,
+        (void*)clip,
+        (void*)pConfig->callback,
+        pConfig->pUserData,
+        (unsigned long long)clip->soundHash,
+        (unsigned int)clip->flags,
+        (void*)ma_sound_get_data_source(&clip->sound));
     return clip;
 }
 
 MA_API void ma_ex_audio_clip_uninit(ma_ex_audio_clip *clip) {
     if(clip) {
+        ma_ex_trace_write(
+            "clip",
+            "stage=uninit clipPtr=%p hash=%llu dataSource=%p",
+            (void*)clip,
+            (unsigned long long)clip->soundHash,
+            (void*)ma_sound_get_data_source(&clip->sound));
         ma_sound_uninit(&clip->sound);
         MA_FREE(clip);
     }
@@ -741,6 +1334,16 @@ static ma_result ma_ex_audio_source_finish_prepare(ma_ex_audio_source *source, m
 
     source->clip.soundHash = soundHash;
     ma_ex_audio_source_apply_settings(source);
+    ma_ex_trace_write(
+        "source",
+        "stage=finish-prepare context=%llu source=%llu sourcePtr=%p hash=%llu flags=%u dataSource=%p group=%p",
+        (unsigned long long)(source->context != NULL ? source->context->traceId : 0),
+        (unsigned long long)source->traceId,
+        (void*)source,
+        (unsigned long long)soundHash,
+        (unsigned int)source->clip.flags,
+        (void*)ma_sound_get_data_source(&source->clip.sound),
+        (void*)source->group);
     return MA_SUCCESS;
 }
 
@@ -766,14 +1369,38 @@ MA_API ma_ex_audio_source *ma_ex_audio_source_init(ma_ex_context *context) {
     source->settings.panMode = ma_pan_mode_balance;
     source->settings.spatialization = MA_FALSE;
     source->settings.volume = 1.0f;
+    source->traceId = ma_ex_trace_allocate_source_id();
+
+    ma_ex_trace_write(
+        "source",
+        "stage=init context=%llu source=%llu sourcePtr=%p",
+        (unsigned long long)context->traceId,
+        (unsigned long long)source->traceId,
+        (void*)source);
 
     return source;
 }
 
 MA_API void ma_ex_audio_source_uninit(ma_ex_audio_source *source) {
     if(source != NULL) {
+        ma_ex_trace_write(
+            "source",
+            "stage=uninit-begin context=%llu source=%llu sourcePtr=%p hasSound=%u hash=%llu dataSource=%p playing=%u",
+            (unsigned long long)(source->context != NULL ? source->context->traceId : 0),
+            (unsigned long long)source->traceId,
+            (void*)source,
+            (unsigned int)ma_ex_audio_source_has_sound(source),
+            (unsigned long long)source->clip.soundHash,
+            (void*)ma_sound_get_data_source(&source->clip.sound),
+            (unsigned int)(ma_ex_audio_source_has_sound(source) ? ma_sound_is_playing(&source->clip.sound) : MA_FALSE));
         if(ma_ex_audio_source_has_sound(source))
             ma_sound_uninit(&source->clip.sound);
+        ma_ex_trace_write(
+            "source",
+            "stage=uninit-end context=%llu source=%llu sourcePtr=%p",
+            (unsigned long long)(source->context != NULL ? source->context->traceId : 0),
+            (unsigned long long)source->traceId,
+            (void*)source);
         MA_FREE(source);
     }
 }
@@ -787,8 +1414,29 @@ MA_API ma_result ma_ex_audio_source_prepare_from_file(ma_ex_audio_source *source
     
     ma_uint64 soundHash = ma_ex_create_hashcode(filePath, strlen(filePath));
 
-    if(ma_ex_audio_source_has_sound(source))
+    ma_ex_trace_write(
+        "source",
+        "stage=prepare-from-file-begin context=%llu source=%llu sourcePtr=%p file=%s stream=%u hasExisting=%u existingHash=%llu",
+        (unsigned long long)(source->context != NULL ? source->context->traceId : 0),
+        (unsigned long long)source->traceId,
+        (void*)source,
+        filePath,
+        (unsigned int)streamFromDisk,
+        (unsigned int)ma_ex_audio_source_has_sound(source),
+        (unsigned long long)source->clip.soundHash);
+
+    if(ma_ex_audio_source_has_sound(source)) {
+        ma_ex_trace_write(
+            "source",
+            "stage=prepare-from-file-replace context=%llu source=%llu sourcePtr=%p oldHash=%llu oldDataSource=%p playing=%u",
+            (unsigned long long)(source->context != NULL ? source->context->traceId : 0),
+            (unsigned long long)source->traceId,
+            (void*)source,
+            (unsigned long long)source->clip.soundHash,
+            (void*)ma_sound_get_data_source(&source->clip.sound),
+            (unsigned int)ma_sound_is_playing(&source->clip.sound));
         ma_sound_uninit(&source->clip.sound);
+    }
 
     source->clip.flags = MA_SOUND_FLAG_DECODE;
     
@@ -798,6 +1446,15 @@ MA_API ma_result ma_ex_audio_source_prepare_from_file(ma_ex_audio_source *source
     ma_result result = ma_sound_init_from_file(&source->context->engine, filePath, source->clip.flags, source->group, NULL, &source->clip.sound);
 
     if(result != MA_SUCCESS) {
+        ma_ex_trace_write(
+            "source",
+            "stage=prepare-from-file-failed context=%llu source=%llu sourcePtr=%p file=%s result=%d flags=%u",
+            (unsigned long long)(source->context != NULL ? source->context->traceId : 0),
+            (unsigned long long)source->traceId,
+            (void*)source,
+            filePath,
+            (int)result,
+            (unsigned int)source->clip.flags);
         ma_sound_uninit(&source->clip.sound);
         return MA_ERROR;
     }
@@ -821,8 +1478,29 @@ MA_API ma_result ma_ex_audio_source_prepare_from_file_w(ma_ex_audio_source *sour
     
     ma_uint64 soundHash = ma_ex_create_hashcode(filePath, wcslen(filePath));
 
-    if(ma_ex_audio_source_has_sound(source))
+    ma_ex_trace_write(
+        "source",
+        "stage=prepare-from-file-w-begin context=%llu source=%llu sourcePtr=%p filePtr=%p stream=%u hasExisting=%u existingHash=%llu",
+        (unsigned long long)(source->context != NULL ? source->context->traceId : 0),
+        (unsigned long long)source->traceId,
+        (void*)source,
+        (const void*)filePath,
+        (unsigned int)streamFromDisk,
+        (unsigned int)ma_ex_audio_source_has_sound(source),
+        (unsigned long long)source->clip.soundHash);
+
+    if(ma_ex_audio_source_has_sound(source)) {
+        ma_ex_trace_write(
+            "source",
+            "stage=prepare-from-file-w-replace context=%llu source=%llu sourcePtr=%p oldHash=%llu oldDataSource=%p playing=%u",
+            (unsigned long long)(source->context != NULL ? source->context->traceId : 0),
+            (unsigned long long)source->traceId,
+            (void*)source,
+            (unsigned long long)source->clip.soundHash,
+            (void*)ma_sound_get_data_source(&source->clip.sound),
+            (unsigned int)ma_sound_is_playing(&source->clip.sound));
         ma_sound_uninit(&source->clip.sound);
+    }
 
     source->clip.flags = MA_SOUND_FLAG_DECODE;
     
@@ -832,6 +1510,15 @@ MA_API ma_result ma_ex_audio_source_prepare_from_file_w(ma_ex_audio_source *sour
     ma_result result = ma_sound_init_from_file_w(&source->context->engine, filePath, source->clip.flags, source->group, NULL, &source->clip.sound);
 
     if(result != MA_SUCCESS) {
+        ma_ex_trace_write(
+            "source",
+            "stage=prepare-from-file-w-failed context=%llu source=%llu sourcePtr=%p filePtr=%p result=%d flags=%u",
+            (unsigned long long)(source->context != NULL ? source->context->traceId : 0),
+            (unsigned long long)source->traceId,
+            (void*)source,
+            (const void*)filePath,
+            (int)result,
+            (unsigned int)source->clip.flags);
         ma_sound_uninit(&source->clip.sound);
         return MA_ERROR;
     }
@@ -858,14 +1545,44 @@ MA_API ma_result ma_ex_audio_source_prepare_from_memory(ma_ex_audio_source *sour
     
     ma_uint64 soundHash = ma_ex_pointer_to_hashcode(pData);
 
-    if(ma_ex_audio_source_has_sound(source))
+    ma_ex_trace_write(
+        "source",
+        "stage=prepare-from-memory-begin context=%llu source=%llu sourcePtr=%p data=%p dataSize=%llu hasExisting=%u existingHash=%llu",
+        (unsigned long long)(source->context != NULL ? source->context->traceId : 0),
+        (unsigned long long)source->traceId,
+        (void*)source,
+        pData,
+        (unsigned long long)dataSize,
+        (unsigned int)ma_ex_audio_source_has_sound(source),
+        (unsigned long long)source->clip.soundHash);
+
+    if(ma_ex_audio_source_has_sound(source)) {
+        ma_ex_trace_write(
+            "source",
+            "stage=prepare-from-memory-replace context=%llu source=%llu sourcePtr=%p oldHash=%llu oldDataSource=%p playing=%u",
+            (unsigned long long)(source->context != NULL ? source->context->traceId : 0),
+            (unsigned long long)source->traceId,
+            (void*)source,
+            (unsigned long long)source->clip.soundHash,
+            (void*)ma_sound_get_data_source(&source->clip.sound),
+            (unsigned int)ma_sound_is_playing(&source->clip.sound));
         ma_sound_uninit(&source->clip.sound);
+    }
 
     source->clip.flags = MA_SOUND_FLAG_DECODE;
 
     ma_result result = ma_sound_init_from_memory(&source->context->engine, pData, dataSize, source->clip.flags, source->group, NULL, &source->clip.sound);
 
     if(result != MA_SUCCESS) {
+        ma_ex_trace_write(
+            "source",
+            "stage=prepare-from-memory-failed context=%llu source=%llu sourcePtr=%p data=%p dataSize=%llu result=%d",
+            (unsigned long long)(source->context != NULL ? source->context->traceId : 0),
+            (unsigned long long)source->traceId,
+            (void*)source,
+            pData,
+            (unsigned long long)dataSize,
+            (int)result);
         ma_sound_uninit(&source->clip.sound);
         return MA_ERROR;
     }
@@ -895,8 +1612,31 @@ MA_API ma_result ma_ex_audio_source_prepare_from_callback(ma_ex_audio_source *so
     
     ma_uint64 soundHash = ma_ex_pointer_to_hashcode(callback);
 
-    if(ma_ex_audio_source_has_sound(source))
+    ma_ex_trace_write(
+        "source",
+        "stage=prepare-from-callback-begin context=%llu source=%llu sourcePtr=%p callback=%p userData=%p channels=%u sampleRate=%u hasExisting=%u existingHash=%llu",
+        (unsigned long long)(source->context != NULL ? source->context->traceId : 0),
+        (unsigned long long)source->traceId,
+        (void*)source,
+        (void*)callback,
+        pUserData != NULL ? pUserData : source,
+        (unsigned int)channels,
+        (unsigned int)sampleRate,
+        (unsigned int)ma_ex_audio_source_has_sound(source),
+        (unsigned long long)source->clip.soundHash);
+
+    if(ma_ex_audio_source_has_sound(source)) {
+        ma_ex_trace_write(
+            "source",
+            "stage=prepare-from-callback-replace context=%llu source=%llu sourcePtr=%p oldHash=%llu oldDataSource=%p playing=%u",
+            (unsigned long long)(source->context != NULL ? source->context->traceId : 0),
+            (unsigned long long)source->traceId,
+            (void*)source,
+            (unsigned long long)source->clip.soundHash,
+            (void*)ma_sound_get_data_source(&source->clip.sound),
+            (unsigned int)ma_sound_is_playing(&source->clip.sound));
         ma_sound_uninit(&source->clip.sound);
+    }
 
     source->clip.flags = 0;
 
@@ -905,6 +1645,15 @@ MA_API ma_result ma_ex_audio_source_prepare_from_callback(ma_ex_audio_source *so
     ma_result result = ma_sound_init_from_callback(&source->context->engine, &config, source->clip.flags, source->group, NULL, &source->clip.sound);
 
     if(result != MA_SUCCESS) {
+        ma_ex_trace_write(
+            "source",
+            "stage=prepare-from-callback-failed context=%llu source=%llu sourcePtr=%p callback=%p userData=%p result=%d",
+            (unsigned long long)(source->context != NULL ? source->context->traceId : 0),
+            (unsigned long long)source->traceId,
+            (void*)source,
+            (void*)callback,
+            pUserData != NULL ? pUserData : source,
+            (int)result);
         ma_sound_uninit(&source->clip.sound);
         return MA_ERROR;
     }
@@ -920,13 +1669,33 @@ MA_API ma_result ma_ex_audio_source_play_from_callback(ma_ex_audio_source *sourc
 }
 
 MA_API ma_result ma_ex_audio_source_start(ma_ex_audio_source *source) {
+    ma_result result;
     if(source == NULL || ma_ex_audio_source_has_sound(source) == MA_FALSE)
         return MA_ERROR;
-    return ma_sound_start(&source->clip.sound);
+    result = ma_sound_start(&source->clip.sound);
+    ma_ex_trace_write(
+        "source",
+        "stage=start context=%llu source=%llu sourcePtr=%p result=%d hash=%llu dataSource=%p",
+        (unsigned long long)(source->context != NULL ? source->context->traceId : 0),
+        (unsigned long long)source->traceId,
+        (void*)source,
+        (int)result,
+        (unsigned long long)source->clip.soundHash,
+        (void*)ma_sound_get_data_source(&source->clip.sound));
+    return result;
 }
 
 MA_API void ma_ex_audio_source_stop(ma_ex_audio_source *source) {
     if(source != NULL && ma_ex_audio_source_has_sound(source)) {
+        ma_ex_trace_write(
+            "source",
+            "stage=stop context=%llu source=%llu sourcePtr=%p hash=%llu dataSource=%p playing=%u",
+            (unsigned long long)(source->context != NULL ? source->context->traceId : 0),
+            (unsigned long long)source->traceId,
+            (void*)source,
+            (unsigned long long)source->clip.soundHash,
+            (void*)ma_sound_get_data_source(&source->clip.sound),
+            (unsigned int)ma_sound_is_playing(&source->clip.sound));
         ma_sound_stop(&source->clip.sound);
     }
 }
