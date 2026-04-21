@@ -40,6 +40,8 @@ elseif(MINIAUDIOEX_BUILD_PLATFORM STREQUAL "linux_arm")
     target_link_libraries(${PROJECT_NAME} -lpthread -lm -ldl -latomic)
 elseif(MINIAUDIOEX_BUILD_PLATFORM STREQUAL "linux_arm64")
     target_link_libraries(${PROJECT_NAME} -lpthread -lm -ldl -latomic)
+elseif(ANDROID)
+    target_link_libraries(${PROJECT_NAME} -ldl -llog)
 elseif(MINIAUDIOEX_BUILD_PLATFORM STREQUAL "ios")
     set_source_files_properties(
         "${PROJECT_SOURCE_DIR}/src/miniaudio.c"

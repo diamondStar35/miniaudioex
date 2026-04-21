@@ -54,6 +54,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
+#ifdef MA_HAS_AAUDIO
+    #include <dlfcn.h>
+#endif
 #if !defined(_MSC_VER) && !defined(__DMC__)
     #include <wchar.h>      /* For wcslen(), wcsrtombs() */
 #endif
@@ -76,6 +79,17 @@ static MA_INLINE void ma_zero_memory_default(void* p, size_t sz)
 
 #ifndef MA_ZERO_MEMORY
 #define MA_ZERO_MEMORY(p, sz)           ma_zero_memory_default((p), (sz))
+#endif
+
+#ifdef MA_HAS_AAUDIO
+#ifndef MA_EX_AAUDIO_SHARING_MODE_EXCLUSIVE
+#define MA_EX_AAUDIO_SHARING_MODE_EXCLUSIVE 0
+#endif
+#ifndef MA_EX_AAUDIO_SHARING_MODE_SHARED
+#define MA_EX_AAUDIO_SHARING_MODE_SHARED 1
+#endif
+
+typedef ma_int32 (*ma_ex_aaudio_stream_get_i32_proc)(void *);
 #endif
 
 static void ma_ex_update_aaudio_diagnostics(
@@ -122,36 +136,35 @@ static void ma_ex_update_aaudio_diagnostics(
 
 #ifdef MA_HAS_AAUDIO
     if(diagnostics->isAAudio) {
-        ma_AAudioStream *pStream = (ma_AAudioStream *)context->device.aaudio.pStreamPlayback;
+        void *pStream = context->device.aaudio.pStreamPlayback;
 
         diagnostics->usage = context->device.aaudio.usage;
         diagnostics->contentType = context->device.aaudio.contentType;
 
         if(pStream != NULL) {
             if(context->context.aaudio.AAudioStream_getState != NULL) {
-                diagnostics->streamState = ((MA_PFN_AAudioStream_getState)context->context.aaudio.AAudioStream_getState)(pStream);
+                diagnostics->streamState = ((ma_ex_aaudio_stream_get_i32_proc)context->context.aaudio.AAudioStream_getState)(pStream);
             }
             if(context->context.aaudio.AAudioStream_getBufferCapacityInFrames != NULL) {
-                diagnostics->bufferCapacityInFrames = ((MA_PFN_AAudioStream_getBufferCapacityInFrames)context->context.aaudio.AAudioStream_getBufferCapacityInFrames)(pStream);
+                diagnostics->bufferCapacityInFrames = ((ma_ex_aaudio_stream_get_i32_proc)context->context.aaudio.AAudioStream_getBufferCapacityInFrames)(pStream);
             }
             if(context->context.aaudio.AAudioStream_getFramesPerDataCallback != NULL) {
-                diagnostics->framesPerDataCallback = ((MA_PFN_AAudioStream_getFramesPerDataCallback)context->context.aaudio.AAudioStream_getFramesPerDataCallback)(pStream);
+                diagnostics->framesPerDataCallback = ((ma_ex_aaudio_stream_get_i32_proc)context->context.aaudio.AAudioStream_getFramesPerDataCallback)(pStream);
             }
             if(context->context.aaudio.AAudioStream_getFramesPerBurst != NULL) {
-                diagnostics->framesPerBurst = ((MA_PFN_AAudioStream_getFramesPerBurst)context->context.aaudio.AAudioStream_getFramesPerBurst)(pStream);
+                diagnostics->framesPerBurst = ((ma_ex_aaudio_stream_get_i32_proc)context->context.aaudio.AAudioStream_getFramesPerBurst)(pStream);
             }
 
             if(context->context.aaudio.hAAudio != NULL) {
-                typedef ma_int32 (*ma_ex_AAudioStream_get_i32_proc)(ma_AAudioStream *);
-                ma_ex_AAudioStream_get_i32_proc getSharingMode = (ma_ex_AAudioStream_get_i32_proc)ma_dlsym(ma_context_get_log(&context->context), context->context.aaudio.hAAudio, "AAudioStream_getSharingMode");
-                ma_ex_AAudioStream_get_i32_proc getPerformanceMode = (ma_ex_AAudioStream_get_i32_proc)ma_dlsym(ma_context_get_log(&context->context), context->context.aaudio.hAAudio, "AAudioStream_getPerformanceMode");
-                ma_ex_AAudioStream_get_i32_proc getXRunCount = (ma_ex_AAudioStream_get_i32_proc)ma_dlsym(ma_context_get_log(&context->context), context->context.aaudio.hAAudio, "AAudioStream_getXRunCount");
+                ma_ex_aaudio_stream_get_i32_proc getSharingMode = (ma_ex_aaudio_stream_get_i32_proc)dlsym(context->context.aaudio.hAAudio, "AAudioStream_getSharingMode");
+                ma_ex_aaudio_stream_get_i32_proc getPerformanceMode = (ma_ex_aaudio_stream_get_i32_proc)dlsym(context->context.aaudio.hAAudio, "AAudioStream_getPerformanceMode");
+                ma_ex_aaudio_stream_get_i32_proc getXRunCount = (ma_ex_aaudio_stream_get_i32_proc)dlsym(context->context.aaudio.hAAudio, "AAudioStream_getXRunCount");
 
                 if(getSharingMode != NULL) {
                     diagnostics->aaudioSharingMode = getSharingMode(pStream);
-                    if(diagnostics->aaudioSharingMode == MA_AAUDIO_SHARING_MODE_EXCLUSIVE) {
+                    if(diagnostics->aaudioSharingMode == MA_EX_AAUDIO_SHARING_MODE_EXCLUSIVE) {
                         diagnostics->actualShareMode = ma_share_mode_exclusive;
-                    } else if(diagnostics->aaudioSharingMode == MA_AAUDIO_SHARING_MODE_SHARED) {
+                    } else if(diagnostics->aaudioSharingMode == MA_EX_AAUDIO_SHARING_MODE_SHARED) {
                         diagnostics->actualShareMode = ma_share_mode_shared;
                     }
                 }
