@@ -78,6 +78,95 @@ static MA_INLINE void ma_zero_memory_default(void* p, size_t sz)
 #define MA_ZERO_MEMORY(p, sz)           ma_zero_memory_default((p), (sz))
 #endif
 
+static void ma_ex_update_aaudio_diagnostics(
+    ma_ex_context *context,
+    ma_share_mode requestedShareMode,
+    ma_share_mode actualShareMode,
+    ma_bool32 usedSharedFallback,
+    ma_result exclusiveInitResult,
+    ma_result sharedInitResult,
+    ma_performance_profile performanceProfile,
+    ma_uint32 requestedPeriodSizeInFrames)
+{
+    ma_ex_aaudio_diagnostics *diagnostics;
+
+    if(context == NULL) {
+        return;
+    }
+
+    diagnostics = &context->aaudioDiagnostics;
+    MA_ZERO_MEMORY(diagnostics, sizeof(*diagnostics));
+
+    diagnostics->backend = context->context.backend;
+    diagnostics->isAAudio = context->context.backend == ma_backend_aaudio;
+    diagnostics->requestedShareMode = requestedShareMode;
+    diagnostics->actualShareMode = actualShareMode;
+    diagnostics->usedSharedFallback = usedSharedFallback;
+    diagnostics->performanceProfile = performanceProfile;
+    diagnostics->exclusiveInitResult = exclusiveInitResult;
+    diagnostics->sharedInitResult = sharedInitResult;
+    diagnostics->deviceState = ma_device_get_state(&context->device);
+    diagnostics->format = context->device.playback.internalFormat;
+    diagnostics->channels = context->device.playback.internalChannels;
+    diagnostics->sampleRate = context->device.playback.internalSampleRate;
+    diagnostics->requestedPeriodSizeInFrames = requestedPeriodSizeInFrames;
+    diagnostics->internalPeriodSizeInFrames = context->device.playback.internalPeriodSizeInFrames;
+    diagnostics->internalPeriods = context->device.playback.internalPeriods;
+    diagnostics->streamState = -1;
+    diagnostics->bufferCapacityInFrames = -1;
+    diagnostics->framesPerDataCallback = -1;
+    diagnostics->framesPerBurst = -1;
+    diagnostics->aaudioSharingMode = -1;
+    diagnostics->aaudioPerformanceMode = -1;
+    diagnostics->xRunCount = -1;
+
+#ifdef MA_SUPPORT_AAUDIO
+    if(diagnostics->isAAudio) {
+        ma_AAudioStream *pStream = (ma_AAudioStream *)context->device.aaudio.pStreamPlayback;
+
+        diagnostics->usage = context->device.aaudio.usage;
+        diagnostics->contentType = context->device.aaudio.contentType;
+
+        if(pStream != NULL) {
+            if(context->context.aaudio.AAudioStream_getState != NULL) {
+                diagnostics->streamState = ((MA_PFN_AAudioStream_getState)context->context.aaudio.AAudioStream_getState)(pStream);
+            }
+            if(context->context.aaudio.AAudioStream_getBufferCapacityInFrames != NULL) {
+                diagnostics->bufferCapacityInFrames = ((MA_PFN_AAudioStream_getBufferCapacityInFrames)context->context.aaudio.AAudioStream_getBufferCapacityInFrames)(pStream);
+            }
+            if(context->context.aaudio.AAudioStream_getFramesPerDataCallback != NULL) {
+                diagnostics->framesPerDataCallback = ((MA_PFN_AAudioStream_getFramesPerDataCallback)context->context.aaudio.AAudioStream_getFramesPerDataCallback)(pStream);
+            }
+            if(context->context.aaudio.AAudioStream_getFramesPerBurst != NULL) {
+                diagnostics->framesPerBurst = ((MA_PFN_AAudioStream_getFramesPerBurst)context->context.aaudio.AAudioStream_getFramesPerBurst)(pStream);
+            }
+
+            if(context->context.aaudio.hAAudio != NULL) {
+                typedef ma_int32 (*ma_ex_AAudioStream_get_i32_proc)(ma_AAudioStream *);
+                ma_ex_AAudioStream_get_i32_proc getSharingMode = (ma_ex_AAudioStream_get_i32_proc)ma_dlsym(ma_context_get_log(&context->context), context->context.aaudio.hAAudio, "AAudioStream_getSharingMode");
+                ma_ex_AAudioStream_get_i32_proc getPerformanceMode = (ma_ex_AAudioStream_get_i32_proc)ma_dlsym(ma_context_get_log(&context->context), context->context.aaudio.hAAudio, "AAudioStream_getPerformanceMode");
+                ma_ex_AAudioStream_get_i32_proc getXRunCount = (ma_ex_AAudioStream_get_i32_proc)ma_dlsym(ma_context_get_log(&context->context), context->context.aaudio.hAAudio, "AAudioStream_getXRunCount");
+
+                if(getSharingMode != NULL) {
+                    diagnostics->aaudioSharingMode = getSharingMode(pStream);
+                    if(diagnostics->aaudioSharingMode == MA_AAUDIO_SHARING_MODE_EXCLUSIVE) {
+                        diagnostics->actualShareMode = ma_share_mode_exclusive;
+                    } else if(diagnostics->aaudioSharingMode == MA_AAUDIO_SHARING_MODE_SHARED) {
+                        diagnostics->actualShareMode = ma_share_mode_shared;
+                    }
+                }
+                if(getPerformanceMode != NULL) {
+                    diagnostics->aaudioPerformanceMode = getPerformanceMode(pStream);
+                }
+                if(getXRunCount != NULL) {
+                    diagnostics->xRunCount = getXRunCount(pStream);
+                }
+            }
+        }
+    }
+#endif
+}
+
 #ifndef MA_ZERO_OBJECT
 #define MA_ZERO_OBJECT(p)               MA_ZERO_MEMORY((p), sizeof(*(p)))
 #endif
@@ -258,6 +347,8 @@ MA_API ma_ex_context_config ma_ex_context_config_init(ma_uint32 sampleRate, ma_u
     MA_ASSERT(channels > 0);
 
     ma_ex_context_config config;
+    MA_ZERO_OBJECT(&config);
+
     config.sampleRate = sampleRate;
     config.channels = channels;
     config.periodSizeInFrames = periodSizeInFrames == 0 ? 0 : ma_next_power_of_two(periodSizeInFrames);
@@ -272,10 +363,37 @@ MA_API ma_ex_context_config ma_ex_context_config_init(ma_uint32 sampleRate, ma_u
     return config;
 }
 
-MA_API ma_ex_context *ma_ex_context_init(const ma_ex_context_config *config) {
+MA_API ma_ex_aaudio_config ma_ex_context_aaudio_config_init(void) {
+    ma_ex_aaudio_config config;
+    MA_ZERO_OBJECT(&config);
+
+    config.usage = ma_aaudio_usage_default;
+    config.contentType = ma_aaudio_content_type_default;
+    config.playbackShareMode = ma_share_mode_shared;
+    config.allowSharedFallback = MA_FALSE;
+    config.allowSetBufferCapacity = MA_FALSE;
+
+#if defined(__ANDROID__)
+    config.usage = ma_aaudio_usage_game;
+    config.contentType = ma_aaudio_content_type_music;
+    config.playbackShareMode = ma_share_mode_exclusive;
+    config.allowSharedFallback = MA_TRUE;
+#endif
+
+    return config;
+}
+
+static ma_ex_context *ma_ex_context_init_internal(const ma_ex_context_config *config, const ma_ex_aaudio_config *aaudioConfig) {
     MA_ASSERT(config != NULL);
     MA_ASSERT(config->sampleRate > 0);
     MA_ASSERT(config->channels > 0);
+
+    ma_result result;
+    ma_result exclusiveInitResult = MA_SUCCESS;
+    ma_result sharedInitResult = MA_SUCCESS;
+    ma_share_mode requestedShareMode;
+    ma_share_mode actualShareMode;
+    ma_bool32 usedSharedFallback = MA_FALSE;
 
     ma_ex_context *context = MA_MALLOC(sizeof(ma_ex_context));
     MA_ZERO_OBJECT(context);
@@ -300,6 +418,14 @@ MA_API ma_ex_context *ma_ex_context_init(const ma_ex_context_config *config) {
     deviceConfig.sampleRate = context->sampleRate;
     deviceConfig.dataCallback = config->deviceDataProc == NULL ? &ma_ex_on_data_proc : config->deviceDataProc;
     deviceConfig.periodSizeInFrames = config->periodSizeInFrames;
+    deviceConfig.performanceProfile = ma_performance_profile_low_latency;
+    deviceConfig.playback.shareMode = aaudioConfig->playbackShareMode;
+    deviceConfig.aaudio.usage = aaudioConfig->usage;
+    deviceConfig.aaudio.contentType = aaudioConfig->contentType;
+    deviceConfig.aaudio.allowSetBufferCapacity = aaudioConfig->allowSetBufferCapacity;
+
+    requestedShareMode = deviceConfig.playback.shareMode;
+    actualShareMode = requestedShareMode;
 
     ma_device_info* pPlaybackInfos;
     ma_uint32 playbackCount;
@@ -328,7 +454,29 @@ MA_API ma_ex_context *ma_ex_context_init(const ma_ex_context_config *config) {
 
     deviceConfig.playback.pDeviceID = pSelectedDevice;
 
-    if(ma_device_init(&context->context, &deviceConfig, &context->device) != MA_SUCCESS) {
+    result = ma_device_init(&context->context, &deviceConfig, &context->device);
+
+    if(requestedShareMode == ma_share_mode_exclusive) {
+        exclusiveInitResult = result;
+    } else {
+        sharedInitResult = result;
+    }
+
+    if(result != MA_SUCCESS && requestedShareMode == ma_share_mode_exclusive && aaudioConfig->allowSharedFallback) {
+        ma_device_config sharedDeviceConfig = deviceConfig;
+        sharedDeviceConfig.playback.shareMode = ma_share_mode_shared;
+
+        result = ma_device_init(&context->context, &sharedDeviceConfig, &context->device);
+        sharedInitResult = result;
+
+        if(result == MA_SUCCESS) {
+            deviceConfig = sharedDeviceConfig;
+            actualShareMode = ma_share_mode_shared;
+            usedSharedFallback = MA_TRUE;
+        }
+    }
+
+    if(result != MA_SUCCESS) {
         fprintf(stderr, "Failed to initialize ma_device\n");
         ma_context_uninit(&context->context);
         MA_FREE(context);
@@ -374,11 +522,37 @@ MA_API ma_ex_context *ma_ex_context_init(const ma_ex_context_config *config) {
         return NULL;
     }
 
+    ma_ex_update_aaudio_diagnostics(
+        context,
+        requestedShareMode,
+        actualShareMode,
+        usedSharedFallback,
+        exclusiveInitResult,
+        sharedInitResult,
+        deviceConfig.performanceProfile,
+        config->periodSizeInFrames);
+
     for(size_t i = 0; i < MA_ENGINE_MAX_LISTENERS; i++) {
         context->listeners[i] = -1;
     }
 
     return context;
+}
+
+MA_API ma_ex_context *ma_ex_context_init(const ma_ex_context_config *config) {
+    ma_ex_aaudio_config aaudioConfig = ma_ex_context_aaudio_config_init();
+    return ma_ex_context_init_internal(config, &aaudioConfig);
+}
+
+MA_API ma_ex_context *ma_ex_context_init_ex(const ma_ex_context_config *config, const ma_ex_aaudio_config *aaudioConfig) {
+    ma_ex_aaudio_config resolvedAAudioConfig;
+
+    if(aaudioConfig == NULL) {
+        resolvedAAudioConfig = ma_ex_context_aaudio_config_init();
+        aaudioConfig = &resolvedAAudioConfig;
+    }
+
+    return ma_ex_context_init_internal(config, aaudioConfig);
 }
 
 MA_API void ma_ex_context_uninit(ma_ex_context *context) {
@@ -412,6 +586,24 @@ MA_API ma_node_graph *ma_ex_context_get_engine_node_graph(ma_ex_context *context
     if(context == NULL)
         return NULL;
     return ma_engine_get_node_graph(&context->engine);
+}
+
+MA_API ma_bool32 ma_ex_context_get_aaudio_diagnostics(ma_ex_context *context, ma_ex_aaudio_diagnostics *diagnostics) {
+    if(context == NULL || diagnostics == NULL)
+        return MA_FALSE;
+
+    ma_ex_update_aaudio_diagnostics(
+        context,
+        context->aaudioDiagnostics.requestedShareMode,
+        context->aaudioDiagnostics.actualShareMode,
+        context->aaudioDiagnostics.usedSharedFallback,
+        context->aaudioDiagnostics.exclusiveInitResult,
+        context->aaudioDiagnostics.sharedInitResult,
+        context->aaudioDiagnostics.performanceProfile,
+        context->aaudioDiagnostics.requestedPeriodSizeInFrames);
+
+    *diagnostics = context->aaudioDiagnostics;
+    return context->aaudioDiagnostics.isAAudio;
 }
 
 MA_API void *ma_ex_device_get_user_data(ma_device *pDevice) {

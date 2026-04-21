@@ -61,6 +61,40 @@ jobs:
         name: miniaudioex-build-macos-x86_64
         path: build/
 
+  build-ios-arm64:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        arch: [arm64]  # iOS device architecture
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    - name: Set up dependencies on MacOS
+      run: |
+        echo "Setting up dependencies for iOS ${{ matrix.arch }}"
+        brew update && (brew list cmake || brew install cmake)
+
+    - name: Build the project for iOS
+      run: |
+        echo "Building project for iOS ${{ matrix.arch }}"
+        cmake -S . -B build -G Xcode \
+          -DMINIAUDIOEX_BUILD_PLATFORM=ios \
+          -DMINIAUDIOEX_BUILD_SHARED=OFF \
+          -DCMAKE_SYSTEM_NAME=iOS \
+          -DCMAKE_OSX_SYSROOT=iphoneos \
+          -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
+          -DCMAKE_XCODE_ATTRIBUTE_ONLY_ACTIVE_ARCH=NO \
+          -DCMAKE_BUILD_TYPE=Release
+        cmake --build build --config Release
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: miniaudioex-build-ios-arm64
+        path: build/
+
   build-linux:
     runs-on: ubuntu-22.04
     strategy:

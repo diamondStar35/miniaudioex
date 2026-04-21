@@ -102,6 +102,45 @@ struct ma_ex_context_config {
     ma_device_data_proc deviceDataProc;
 };
 
+typedef struct ma_ex_aaudio_config ma_ex_aaudio_config;
+
+struct ma_ex_aaudio_config {
+    ma_aaudio_usage usage;
+    ma_aaudio_content_type contentType;
+    ma_share_mode playbackShareMode;
+    ma_bool32 allowSharedFallback;
+    ma_bool32 allowSetBufferCapacity;
+};
+
+typedef struct ma_ex_aaudio_diagnostics ma_ex_aaudio_diagnostics;
+
+struct ma_ex_aaudio_diagnostics {
+    ma_bool32 isAAudio;
+    ma_backend backend;
+    ma_aaudio_usage usage;
+    ma_aaudio_content_type contentType;
+    ma_share_mode requestedShareMode;
+    ma_share_mode actualShareMode;
+    ma_bool32 usedSharedFallback;
+    ma_performance_profile performanceProfile;
+    ma_result exclusiveInitResult;
+    ma_result sharedInitResult;
+    ma_device_state deviceState;
+    ma_format format;
+    ma_uint32 channels;
+    ma_uint32 sampleRate;
+    ma_uint32 requestedPeriodSizeInFrames;
+    ma_uint32 internalPeriodSizeInFrames;
+    ma_uint32 internalPeriods;
+    ma_int32 streamState;
+    ma_int32 bufferCapacityInFrames;
+    ma_int32 framesPerDataCallback;
+    ma_int32 framesPerBurst;
+    ma_int32 aaudioSharingMode;
+    ma_int32 aaudioPerformanceMode;
+    ma_int32 xRunCount;
+};
+
 typedef struct ma_ex_context ma_ex_context;
 
 struct ma_ex_context {
@@ -113,6 +152,7 @@ struct ma_ex_context {
     ma_uint8 channels;
     ma_format format;
     ma_int32 listeners[MA_ENGINE_MAX_LISTENERS];
+    ma_ex_aaudio_diagnostics aaudioDiagnostics;
 };
 
 typedef struct ma_ex_audio_source_settings ma_ex_audio_source_settings;
@@ -179,12 +219,15 @@ MA_API ma_ex_device_info *ma_ex_playback_devices_get(ma_uint32 *count);
 MA_API void ma_ex_playback_devices_free(ma_ex_device_info *pDeviceInfo, ma_uint32 count);
 
 MA_API ma_ex_context_config ma_ex_context_config_init(ma_uint32 sampleRate, ma_uint8 channels, ma_uint32 periodSizeInFrames, const ma_ex_device_info *pDeviceInfo);
+MA_API ma_ex_aaudio_config ma_ex_context_aaudio_config_init(void);
 MA_API ma_ex_context *ma_ex_context_init(const ma_ex_context_config *config);
+MA_API ma_ex_context *ma_ex_context_init_ex(const ma_ex_context_config *config, const ma_ex_aaudio_config *aaudioConfig);
 MA_API void ma_ex_context_uninit(ma_ex_context *context);
 MA_API void ma_ex_context_set_master_volume(ma_ex_context *context, float volume);
 MA_API float ma_ex_context_get_master_volume(ma_ex_context *context);
 MA_API ma_engine *ma_ex_context_get_engine(ma_ex_context *context);
 MA_API ma_node_graph *ma_ex_context_get_engine_node_graph(ma_ex_context *context);
+MA_API ma_bool32 ma_ex_context_get_aaudio_diagnostics(ma_ex_context *context, ma_ex_aaudio_diagnostics *diagnostics);
 
 MA_API void *ma_ex_device_get_user_data(ma_device *pDevice);
 
